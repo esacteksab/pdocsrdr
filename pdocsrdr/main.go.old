@@ -1,0 +1,481 @@
+package main
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+)
+
+// Styles holds the different styles for UI elements
+type Styles struct {
+	Title       lipgloss.Style
+	Header      lipgloss.Style
+	Description lipgloss.Style
+	Type        lipgloss.Style
+	Required    lipgloss.Style
+	Search      lipgloss.Style
+	Selected    lipgloss.Style
+}
+
+// ViewMode represents different view states
+type ViewMode int
+
+const (
+	BrowsingMode ViewMode = iota
+	SearchMode
+	ResourceViewMode
+	ParameterViewMode
+)
+
+// SortMode represents different sorting options
+type SortMode int
+
+const (
+	Alphabetical SortMode = iota
+	RequiredFirst
+)
+
+// Resource represents a Terraform resource or data source
+type Resource struct {
+	Name        string
+	Type        string // "resource" or "data"
+	Schema      map[string]*schema.Schema
+	Description string
+}
+
+// Parameter represents a schema parameter
+type Parameter struct {
+	Name        string
+	Schema      *schema.Schema
+	Path        string
+	Required    bool
+	Type        string
+	Description string
+	Default     interface{}
+}
+
+// Model represents the application state
+type Model struct {
+	viewport       viewport.Model
+	searchInput    textinput.Model
+	resources      []Resource
+	parameters     []Parameter
+	filteredItems  []string
+	currentItem    *Resource
+	currentParam   *Parameter
+	mode          ViewMode
+	sortMode      SortMode
+	styles        Styles
+	ready         bool
+	height        int
+	width         int
+}
+
+type keymap struct{}
+
+func (k keymap) ShortHelp() [].key.Binding {
+	return [].key.Binding{
+		key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "Search"))
+		key.NewBinding(key.WithKeys("/r"), key.WithHelp("/r", "Search Resources"))
+		key.NewBinding(key.WithKeys("/d"), key.WithHelp("/d", "Search Data Sources"))
+		key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "Complete")),
+		key.NewBinding(key.WithKeys("k"), key.WithHelp("k", "Next"))
+		key.NewBinding(key.WithKeys("j"), key.WithHelp("j"), "Previous")
+		key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc"), "Quit")
+	}
+}
+
+func (k keymap) FullHelp() [][].key.Binding {
+	return [][].key.Binding(k.ShortHelp())
+}
+
+
+
+func initialModel() Model {
+	ti := searchInput.New()
+	ti.Placeholder = "Type to search..."
+	ti.Prompt = "Resource or Data Source"
+	ti.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
+	ti.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
+	ti.Focus()
+	ti.CharLimit = 156
+	ti.Width = 20
+	ti.ShowSuggestions = true
+
+	h := help.New()
+
+	km = keymap{}
+
+	return Model{
+		searchInput: ti,
+		styles: Styles{
+			Title:       lipgloss.NewStyle().Foreground(lipgloss.Color("#7CE38B")).Bold(true).MarginLeft(2),
+			Header:      lipgloss.NewStyle().Foreground(lipgloss.Color("#A9B1D6")).Bold(true),
+			Description: lipgloss.NewStyle().Foreground(lipgloss.Color("#9ECE6A")),
+			Type:        lipgloss.NewStyle().Foreground(lipgloss.Color("#BB9AF7")),
+			Required:    lipgloss.NewStyle().Foreground(lipgloss.Color("#F7768E")),
+			Search:      lipgloss.NewStyle().Foreground(lipgloss.Color("#FF9E64")),
+			Selected:    lipgloss.NewStyle().Background(lipgloss.Color("#414868")),
+		},
+		mode:     BrowsingMode,
+		sortMode: Alphabetical,
+	}
+}
+
+func (m Model) Init() tea.Cmd {
+	return tea.Batch()
+}
+
+// filterItems filters resources or parameters based on search query
+func (m *Model) filterItems(query string) {
+	m.filteredItems = make([]string, 0)
+
+	switch {
+	case strings.HasPrefix(query, "/r "):
+		// Filter resources
+		searchTerm := strings.TrimPrefix(query, "/r ")
+		for _, r := range m.resources {
+			if r.Type == "resource" && strings.Contains(r.Name, searchTerm) {
+				m.filteredItems = append(m.filteredItems, r.Name)
+			}
+		}
+	case strings.HasPrefix(query, "/d "):
+		// Filter data sources
+		searchTerm := strings.TrimPrefix(query, "/d ")
+		for _, r := range m.resources {
+			if r.Type == "data" && strings.Contains(r.Name, searchTerm) {
+				m.filteredItems = append(m.filteredItems, r.Name)
+			}
+		}
+	case strings.Contains(query, "."):
+		// Parameter direct access
+		parts := strings.Split(query, ".")
+		if len(parts) == 2 {
+			resourceName, paramName := parts[0], parts[1]
+			for _, r := range m.resources {
+				if r.Name == resourceName {
+					for name, schema := range r.Schema {
+						if strings.HasPrefix(name, paramName) {
+							m.filteredItems = append(m.filteredItems, fmt.Sprintf("%s.%s", resourceName, name))
+						}
+					}
+				}
+			}
+		}
+	default:
+		// Filter parameters in current resource
+		if m.currentItem != nil {
+			for name := range m.currentItem.Schema {
+				if strings.Contains(name, query) {
+					m.filteredItems = append(m.filteredItems, name)
+				}
+			}
+		}
+	}
+
+	sort.Strings(m.filteredItems)
+}
+
+// getTerraformSyntax returns example syntax for a schema type
+func getTerraformSyntax(s *schema.Schema) string {
+	switch s.Type {
+	case schema.TypeString:
+		return `"example"`
+	case schema.TypeInt:
+		return "42"
+	case schema.TypeFloat:
+		return "3.14"
+	case schema.TypeBool:
+		return "true"
+	case schema.TypeList:
+		if elem, ok := s.Elem.(*schema.Schema); ok {
+			return fmt.Sprintf("[%s]", getTerraformSyntax(elem))
+		}
+		return "[...]"
+	case schema.TypeSet:
+		if elem, ok := s.Elem.(*schema.Schema); ok {
+			return fmt.Sprintf("toset([%s])", getTerraformSyntax(elem))
+		}
+		return "toset([...])"
+	case schema.TypeMap:
+		if elem, ok := s.Elem.(*schema.Schema); ok {
+			return fmt.Sprintf(`{ key = %s }`, getTerraformSyntax(elem))
+		}
+		return "{ key = value }"
+	default:
+		return "..."
+	}
+}
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	var cmds []tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "esc":
+			if m.mode == SearchMode {
+				if m.mode != m.currentItem {
+					m.mode = ResourceViewMode
+				} else {
+					m.mode = BrowsingMode
+				}
+				return m, nil
+			}
+			return m, tea.Quit
+
+		case "/":
+			if m.mode != SearchMode {
+				m.mode = SearchMode
+				m.searchInput.Focus()
+				return m, textinput.Blink
+			}
+
+		case "tab":
+			if m.mode == ResourceViewMode {
+				m.sortMode = (m.sortMode + 1) % 2
+				m.viewport.SetContent(m.renderResource())
+			}
+
+		case "enter":
+			if m.mode == SearchMode && len(m.filteredItems) > 0 {
+				selected := m.filteredItems[0]
+				if strings.Contains(selected, ".") {
+					// Parameter direct access
+					parts := strings.Split(selected, ".")
+					resourceName, paramName := parts[0], parts[1]
+					for _, r := range m.resources {
+						if r.Name == resourceName {
+							m.currentItem = &r
+							if schema, ok := r.Schema[paramName]; ok {
+								m.currentParam = &Parameter{
+									Name:        paramName,
+									Schema:      schema,
+									Path:        selected,
+									Required:    schema.Required,
+									Type:        schema.Type.String(),
+									Description: schema.Description,
+									Default:     schema.Default,
+								}
+								m.mode = ParameterViewMode
+								m.viewport.SetContent(m.renderParameter())
+							}
+							break
+						}
+					}
+				} else {
+					// Resource selection
+					for _, r := range m.resources {
+						if r.Name == selected {
+							m.currentItem = &r
+							m.mode = ResourceViewMode
+							m.viewport.SetContent(m.renderResource())
+							break
+						}
+					}
+				}
+				m.searchInput.Reset()
+				return m, nil
+			}
+		}
+
+	case tea.WindowSizeMsg:
+		if !m.ready {
+			m.viewport = viewport.New(msg.Width, msg.Height-4)
+			m.ready = true
+		}
+		m.width = msg.Width
+		m.height = msg.Height
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - 4
+	}
+
+	if m.mode == SearchMode {
+		m.searchInput, cmd = m.searchInput.Update(msg)
+		m.filterItems(m.searchInput.Value())
+		cmds = append(cmds, cmd)
+	}
+
+	m.viewport, cmd = m.viewport.Update(msg)
+	cmds = append(cmds, cmd)
+
+	return m, tea.Batch(cmds...)
+}
+
+func (m Model) View() string {
+	if !m.ready {
+		return "Initializing..."
+	}
+
+	var sb strings.Builder
+
+	// Title bar
+	sb.WriteString(m.styles.Title.Render("Terraform Provider Documentation"))
+	sb.WriteString("\n")
+
+	// Search bar when in search mode
+	if m.mode == SearchMode {
+		sb.WriteString(m.styles.Search.Render(m.searchInput.View()))
+		sb.WriteString("\n")
+
+		// Show filtered results
+		for _, item := range m.filteredItems {
+			sb.WriteString(fmt.Sprintf("  %s\n", item))
+		}
+	}
+
+	// Main content
+	sb.WriteString(m.viewport.View())
+
+	// Footer
+	footer := ""
+	switch m.mode {
+	case BrowsingMode:
+		footer = "/ : search • q : quit"
+	case ResourceViewMode:
+		footer = "/ : search parameters • tab : toggle sort • q : quit"
+	case SearchMode:
+		footer = "enter : select • esc : cancel • ctrl+c : quit"
+	case ParameterViewMode:
+		footer = "esc : back • q : quit"
+	}
+
+	sb.WriteString("\n" + m.styles.Description.Render(footer))
+
+	return sb.String()
+}
+
+func (m Model) renderResource() string {
+	var sb strings.Builder
+
+	if m.currentItem == nil {
+		return "No resource selected"
+	}
+
+	sb.WriteString(m.styles.Header.Render(fmt.Sprintf("%s %s\n\n",
+		strings.ToUpper(m.currentItem.Type),
+		m.currentItem.Name)))
+
+	sb.WriteString(m.styles.Description.Render(m.currentItem.Description))
+	sb.WriteString("\n\n")
+
+	// Get parameters and sort them
+	var params []Parameter
+	for name, s := range m.currentItem.Schema {
+		params = append(params, Parameter{
+			Name:        name,
+			Schema:      s,
+			Required:    s.Required,
+			Type:        s.Type.String(),
+			Description: s.Description,
+		})
+	}
+
+	switch m.sortMode {
+	case Alphabetical:
+		sort.Slice(params, func(i, j int) bool {
+			return params[i].Name < params[j].Name
+		})
+	case RequiredFirst:
+		sort.Slice(params, func(i, j int) bool {
+			if params[i].Required != params[j].Required {
+				return params[i].Required
+			}
+			return params[i].Name < params[j].Name
+		})
+	}
+
+	// Render parameters
+	for _, p := range params {
+		required := ""
+		if p.Required {
+			required = m.styles.Required.Render(" (Required)")
+		}
+
+		sb.WriteString(fmt.Sprintf("%s%s\n", p.Name, required))
+		sb.WriteString(m.styles.Type.Render(fmt.Sprintf("Type: %s\n", p.Type)))
+		sb.WriteString(fmt.Sprintf("Example: %s\n", getTerraformSyntax(p.Schema)))
+		sb.WriteString(m.styles.Description.Render(p.Description))
+		sb.WriteString("\n\n")
+	}
+
+	return sb.String()
+}
+
+func (m Model) renderParameter() string {
+	var sb strings.Builder
+
+	if m.currentParam == nil {
+		return "No parameter selected"
+	}
+
+	sb.WriteString(m.styles.Header.Render(m.currentParam.Path))
+	sb.WriteString("\n\n")
+
+	if m.currentParam.Required {
+		sb.WriteString(m.styles.Required.Render("Required: true\n"))
+	} else {
+		sb.WriteString("Required: false\n")
+	}
+
+	sb.WriteString(m.styles.Type.Render(fmt.Sprintf("Type: %s\n", m.currentParam.Type)))
+	sb.WriteString(fmt.Sprintf("Example: %s\n\n", getTerraformSyntax(m.currentParam.Schema)))
+
+	if m.currentParam.Description != "" {
+		sb.WriteString(m.styles.Description.Render(m.currentParam.Description))
+		sb.WriteString("\n")
+	}
+
+	if m.currentParam.Default != nil {
+		sb.WriteString(fmt.Sprintf("\nDefault: %v\n", m.currentParam.Default))
+	}
+
+	return sb.String()
+}
+
+func main() {
+	// Initialize with sample data - in practice, this would load from provider schemas
+	// sampleResources := []Resource{
+	// 	{
+	// 		Name: "aws_security_group",
+	// 		Type: "resource",
+	// 		Schema: map[string]*schema.Schema{
+	// 			"name": {
+	// 				Type:        schema.TypeString,
+	// 				Required:    true,
+	// 				Description: "The name of the security group",
+	// 			},
+	// 			"description": {
+	// 				Type:        schema.TypeString,
+	// 				Optional:    true,
+	// 				Description: "The security group description",
+	// 				Default:     "Managed by Terraform",
+	// 			},
+	// 			"to_port": {
+	// 				Type:        schema.TypeInt,
+	// 				Required:    true,
+	// 				Description: "The end range port",
+	// 			},
+	// 		},
+	// 		Description: "Provides a security group resource",
+	// 	},
+	// 	// Add more resources as needed
+	// }
+
+	// m := initialModel()
+	// m.resources = sampleResources
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Error running program: %v", err)
+	}
+}
